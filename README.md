@@ -1,6 +1,6 @@
 # getpid
 
-**Pure-syscall Linux process inspector**
+**syscall Linux process inspector**
 
 `getpid` is a minimalistic process monitoring utility for x86_64 Linux. It is implemented entirely via direct system calls, bypassing the C standard library (`libc`), `crt0`, and the dynamic linker.
 
