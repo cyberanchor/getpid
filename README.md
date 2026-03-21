@@ -45,15 +45,3 @@ musl-gcc -O2 -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
 | `-c` | Enable continuous refresh mode (SIGINT to terminate) |
 | `-v` | Display version information |
 | `-h` | Display help output |
-
-### Example Output
-
-```text
-CPU cores: 8  |  Processes: 412  |  Interval: 1.0s  |  Total CPU: 12.5%  |  Total RSS: 4.2G
-
-    PID  COMMAND                                          USR%    SYS%    CPU%       RSS       IO_RD/s       IO_WR/s
-----------------------------------------------------------------------------------------------------------------------
-   1402  /usr/bin/gnome-shell                             4.2     1.1     5.3     345.1M        0 B/s         0 B/s
-    981  /usr/lib/Xorg                                    2.1     0.8     2.9     102.4M        0 B/s         0 B/s
-  28412  [new] bash                                       0.0     0.1     0.1       4.1M        0 B/s         0 B/s
-```
