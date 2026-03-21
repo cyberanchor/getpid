@@ -1,7 +1,5 @@
 # getpid
 
-**syscall Linux process inspector**
-
 `getpid` no libc crt Linux x86_64 native syscall procmon
 
 ## Features
