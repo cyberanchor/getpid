@@ -25,8 +25,6 @@
  * Build:
  * musl-gcc -O2 -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -nostdlib -nostartfiles -static -ffreestanding -o getpid_raw getpid_raw.c -lgcc
  *
- * Copyright (c) 2025 hs
- * License: MIT
  */
 
 #define GETPID_VERSION "0.4.0"
