@@ -23,8 +23,6 @@
  * Build (dynamic, smaller binary):
  *   gcc -O2 -Wall -Wextra -pedantic -std=gnu11 -o getpid getpid.c
  *
- * Copyright (c) 2025 hs
- * License: MIT
  */
 
 #define _GNU_SOURCE
