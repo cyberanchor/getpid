@@ -2,7 +2,7 @@
 
 **syscall Linux process inspector**
 
-`getpid` is a minimalistic process monitoring utility for x86_64 Linux. It is implemented entirely via direct system calls, bypassing the C standard library (`libc`), `crt0`, and the dynamic linker.
+`getpid` no libc crt Linux x86_64 native syscall procmon
 
 ## Features
 
@@ -16,9 +16,7 @@
 * **Fixed-Point Arithmetic:** Calculates CPU utilization strictly using integer arithmetic to avoid FPU context switching and library dependencies.
 * **Buffered I/O:** Implements a custom 8KB output buffer to minimize `sys_write` overhead.
 
-## Build Instructions
-
-Compilation requires a compiler configured for freestanding execution. Using `musl-gcc` is recommended to properly exclude standard startup files:
+## Compilation
 
 ```sh
 musl-gcc -O2 -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
