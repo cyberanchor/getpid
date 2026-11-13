@@ -554,8 +554,26 @@ static void fmt_mem(long kb, char *out, size_t outsz)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
+ * @brief Make a process-supplied string safe to print in a table cell.
+ *
+ * cmdline and comm are fully controlled by the process they belong to.
+ * Everything outside printable ASCII is replaced with '?': control bytes
+ * (ESC, CR, LF, ...) would otherwise reach the terminal verbatim and let
+ * a process recolor or clear the screen, or forge extra table rows.
+ */
+static void sanitize_text(char *s)
+{
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c < 0x20 || c > 0x7e)
+            *s = '?';
+    }
+}
+
+/**
  * @brief Read /proc/[pid]/cmdline and join NUL-separated args with spaces.
- *        Falls back to [comm] if cmdline is empty (kernel threads).
+ *        Falls back to [comm] if cmdline is empty (kernel threads, zombies,
+ *        processes that wiped their argv).
  */
 static void get_full_cmd(int pid, int tgid, const char *comm_fallback,
                          char *out, size_t outsz)
@@ -566,21 +584,30 @@ static void get_full_cmd(int pid, int tgid, const char *comm_fallback,
 
     char buf[1024];
     int n = read_file(path, buf, sizeof(buf));
+
+    /*
+     * Programs that rewrite their title in place (sshd, postgres, nginx...)
+     * leave the rest of the argv area filled with NULs or spaces.  Drop
+     * that padding, otherwise it becomes trailing blanks and a bogus "...".
+     */
+    while (n > 0 && (buf[n - 1] == '\0' || buf[n - 1] == ' '))
+        n--;
+
     if (n <= 0) {
         snprintf(out, outsz, "[%s]", comm_fallback);
-        return;
+    } else {
+        /* Replace NUL argument separators with spaces */
+        for (int i = 0; i < n; i++) {
+            if (buf[i] == '\0') buf[i] = ' ';
+        }
+
+        size_t len = (size_t)n;
+        if (len >= outsz) len = outsz - 1;
+        memcpy(out, buf, len);
+        out[len] = '\0';
     }
 
-    /* Replace NUL argument separators with spaces */
-    for (int i = 0; i < n - 1; i++) {
-        if (buf[i] == '\0') buf[i] = ' ';
-    }
-    buf[n] = '\0';
-
-    size_t len = strlen(buf);
-    if (len >= outsz) len = outsz - 1;
-    memcpy(out, buf, len);
-    out[len] = '\0';
+    sanitize_text(out);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -671,20 +698,20 @@ static void print_results(snapshot_t *snap, int cores)
         char cmd[512];
         get_full_cmd(e->pid, e->tgid, e->comm, cmd, sizeof(cmd));
 
-        /* Truncate command for display */
-        if (strlen(cmd) > 44) {
-            cmd[41] = '.';
-            cmd[42] = '.';
-            cmd[43] = '.';
-            cmd[44] = '\0';
+        /*
+         * Truncate command for display.  New processes get a " [new]" tag,
+         * so leave room for it: the cell must not exceed 44 characters or
+         * the numeric columns of that row shift to the right.
+         */
+        size_t max_cmd = e->is_new ? 44 - 6 : 44;
+        if (strlen(cmd) > max_cmd) {
+            memcpy(cmd + max_cmd - 3, "...", 3);
+            cmd[max_cmd] = '\0';
         }
 
         /* Annotate new processes that weren't in previous snapshot */
-        if (e->is_new) {
-            size_t clen = strlen(cmd);
-            if (clen + 6 < sizeof(cmd))
-                strcat(cmd, " [new]");
-        }
+        if (e->is_new)
+            strcat(cmd, " [new]");
 
         char mem_str[32];
         fmt_mem(e->rss_kb, mem_str, sizeof(mem_str));
