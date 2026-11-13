@@ -528,6 +528,8 @@ typedef struct {
     char          comm[COMM_LEN];
     unsigned long utime;
     unsigned long stime;
+    unsigned long starttime;      /**< Ticks since boot; tells a task from a
+                                       later one reusing its PID */
     long          rss_kb;
     unsigned long io_read;
     unsigned long io_write;
@@ -645,7 +647,8 @@ static int parse_proc_stat(const char *path, proc_info_t *info)
     info->comm[clen] = '\0';
 
     /*
-     * Fields after ')': state(0) ppid(1) ... flags(6) ... utime(11) stime(12).
+     * Fields after ')': state(0) ppid(1) ... flags(6) ... utime(11) stime(12)
+     * ... starttime(19).
      * flags carries PF_KTHREAD for kernel threads; unlike /proc/pid/exe it is
      * readable for every task, whoever owns it.
      */
@@ -654,16 +657,18 @@ static int parse_proc_stat(const char *path, proc_info_t *info)
     int field;
     info->utime = 0;
     info->stime = 0;
+    info->starttime = 0;
 
-    for (field = 0; field < 13; field++) {
+    for (field = 0; field < 20; field++) {
         while (*p == ' ') p++;
         if (!*p) break;                 /* record ends early */
         if (field == 6) flags = str_to_ulong(p);
         else if (field == 11) info->utime = str_to_ulong(p);
         else if (field == 12) info->stime = str_to_ulong(p);
+        else if (field == 19) info->starttime = str_to_ulong(p);
         while (*p && *p != ' ') p++;
     }
-    if (field < 13) return -1;          /* truncated record: do not trust it */
+    if (field < 20) return -1;          /* truncated record: do not trust it */
 
     info->is_kernel = (flags & PF_KTHREAD) != 0;
     return 0;
@@ -966,7 +971,8 @@ static void compute_deltas(snapshot_t *sa, snapshot_t *sb, int elapsed_ms)
         proc_info_t *b = &sb->entries[i];
         proc_info_t *a = snap_find(sa, b->pid);
 
-        if (!a) {
+        /* Not seen before — or the PID was recycled by another process */
+        if (!a || a->starttime != b->starttime) {
             b->cpu_usr_x10   = 0;
             b->cpu_sys_x10   = 0;
             b->io_rd_rate    = 0;

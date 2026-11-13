@@ -96,7 +96,8 @@ static const char *color_reset(void)
  * @brief Snapshot of a single process (or thread) from /proc.
  *
  * Populated from:
- *   /proc/[pid]/stat    — PID, comm, flags (kernel thread?), utime, stime
+ *   /proc/[pid]/stat    — PID, comm, flags (kernel thread?), utime, stime,
+ *                         starttime
  *   /proc/[pid]/status  — VmRSS, Threads, Tgid
  *   /proc/[pid]/io      — read_bytes, write_bytes (disk I/O, not network)
  */
@@ -108,6 +109,8 @@ typedef struct {
     /* Raw cumulative CPU ticks from /proc/pid/stat fields 14, 15 */
     unsigned long utime;        /**< User-mode CPU ticks                      */
     unsigned long stime;        /**< Kernel-mode CPU ticks                    */
+    unsigned long long starttime; /**< Start time in ticks since boot; tells a
+                                       task from a later one reusing its PID  */
 
     /* Memory from /proc/pid/status VmRSS line, in kB */
     long    rss_kb;
@@ -199,7 +202,7 @@ static int read_file(const char *path, char *buf, size_t bufsz)
 }
 
 /**
- * @brief Parse /proc/[pid]/stat for PID, comm, flags, utime, stime.
+ * @brief Parse /proc/[pid]/stat for PID, comm, flags, utime, stime, starttime.
  *
  * Layout (kernel 2.6+, unchanged through 6.15.x):
  *   pid (comm) state ppid pgrp session tty_nr tpgid flags
@@ -208,8 +211,9 @@ static int read_file(const char *path, char *buf, size_t bufsz)
  * The comm field can contain spaces and parentheses, so we locate
  * the *last* ')' to delimit it reliably.
  *
- * After ')': field[0]=state, field[6]=flags, field[11]=utime, field[12]=stime
- * (0-indexed from the first token after the closing parenthesis).
+ * After ')': field[0]=state, field[6]=flags, field[11]=utime, field[12]=stime,
+ * field[19]=starttime (0-indexed from the first token after the closing
+ * parenthesis).
  *
  * The flags field carries PF_KTHREAD for kernel threads.  Unlike the
  * /proc/[pid]/exe symlink it is readable for every task regardless of
@@ -237,14 +241,15 @@ static int parse_proc_stat(const char *path, proc_info_t *info)
     memcpy(info->comm, lp + 1, clen);
     info->comm[clen] = '\0';
 
-    /* Walk fields after ') ': flags (index 6), utime (11), stime (12) */
+    /* Walk fields after ') ': flags (6), utime (11), stime (12), starttime (19) */
     const char *p = rp + 2; /* skip ") " */
     unsigned long flags = 0;
     int field;
     info->utime = 0;
     info->stime = 0;
+    info->starttime = 0;
 
-    for (field = 0; field < 13; field++) {
+    for (field = 0; field < 20; field++) {
         while (*p == ' ') p++;
         if (!*p) break;                 /* record ends early */
         if (field == 6)
@@ -253,9 +258,11 @@ static int parse_proc_stat(const char *path, proc_info_t *info)
             info->utime = strtoul(p, NULL, 10);
         else if (field == 12)
             info->stime = strtoul(p, NULL, 10);
+        else if (field == 19)
+            info->starttime = strtoull(p, NULL, 10);
         while (*p && *p != ' ') p++;
     }
-    if (field < 13)
+    if (field < 20)
         return -1;                      /* truncated record: do not trust it */
 
     info->is_kernel = (flags & PF_KTHREAD) != 0;
@@ -498,6 +505,8 @@ static proc_info_t *snapshot_find(snapshot_t *snap, int pid)
  *
  * For processes present in both snapshots: delta CPU ticks / elapsed time.
  * For processes only in snap_b (new): CPU and I/O set to 0, marked is_new=1.
+ * A PID whose start time changed belongs to a different process that got
+ * the recycled number; it is new as well.
  * This avoids the bug where a long-running process that missed snap_a
  * would show its entire accumulated CPU time as if it happened in one interval.
  */
@@ -513,11 +522,12 @@ static void compute_deltas(snapshot_t *snap_a, snapshot_t *snap_b,
         proc_info_t *b = &snap_b->entries[i];
         proc_info_t *a = snapshot_find(snap_a, b->pid);
 
-        if (!a) {
+        if (!a || a->starttime != b->starttime) {
             /*
              * Process not in previous snapshot.  Could be:
              *   (a) genuinely new short-lived process
              *   (b) old process missed due to /proc race or permissions
+             *   (c) new process that reuses the PID of one that exited
              * Showing accumulated ticks would be misleading in case (b),
              * so we report 0 and mark as [new] in output.
              */
