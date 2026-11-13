@@ -12,7 +12,6 @@
  *   malloc/realloc/free  → sys_brk arena allocator
  *   sleep/nanosleep      → sys_nanosleep
  *   clock_gettime        → sys_clock_gettime
- *   stat/lstat           → sys_stat/sys_lstat (newfstatat on 6.x)
  *   isatty               → sys_ioctl(TCGETS)
  *   qsort                → custom insertion sort (good enough for ≤8K entries)
  *   getopt               → custom argument parser
@@ -50,8 +49,6 @@ typedef int                 pid_t;
 #define SYS_write           1
 #define SYS_open            2
 #define SYS_close           3
-#define SYS_stat            4
-#define SYS_lstat           6
 #define SYS_brk             12
 #define SYS_rt_sigaction    13
 #define SYS_ioctl           16
@@ -77,6 +74,9 @@ typedef int                 pid_t;
 
 /* dirent type */
 #define DT_DIR 4
+
+/* Task flag "I am a kernel thread" (linux/sched.h), field 9 of /proc/pid/stat */
+#define PF_KTHREAD 0x00200000
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Inline syscall wrappers (x86_64 calling convention)
@@ -155,38 +155,6 @@ static inline int sys_open(const char *path, int flags)
 static inline int sys_close(int fd)
 {
     return (int)syscall1(SYS_close, fd);
-}
-
-/* struct stat64 layout for x86_64 (from kernel, not glibc) */
-struct kernel_stat {
-    unsigned long st_dev;
-    unsigned long st_ino;
-    unsigned long st_nlink;
-    unsigned int  st_mode;
-    unsigned int  st_uid;
-    unsigned int  st_gid;
-    unsigned int  __pad0;
-    unsigned long st_rdev;
-    long          st_size;
-    long          st_blksize;
-    long          st_blocks;
-    unsigned long st_atime_sec;
-    unsigned long st_atime_nsec;
-    unsigned long st_mtime_sec;
-    unsigned long st_mtime_nsec;
-    unsigned long st_ctime_sec;
-    unsigned long st_ctime_nsec;
-    long          __unused[3];
-};
-
-static inline int sys_lstat(const char *path, struct kernel_stat *st)
-{
-    return (int)syscall2(SYS_lstat, (long)path, (long)st);
-}
-
-static inline int sys_stat(const char *path, struct kernel_stat *st)
-{
-    return (int)syscall2(SYS_stat, (long)path, (long)st);
 }
 
 static inline long sys_getdents64(int fd, void *buf, size_t count)
@@ -648,7 +616,7 @@ static int parse_proc_stat(const char *path, proc_info_t *info)
 
     char *lp = str_chr(buf, '(');
     char *rp = str_rchr(buf, ')');
-    if (!lp || !rp || rp <= lp) return -1;
+    if (!lp || !rp || rp <= lp || rp[1] != ' ') return -1;
 
     info->pid = str_to_int(buf);
 
@@ -657,18 +625,28 @@ static int parse_proc_stat(const char *path, proc_info_t *info)
     mem_copy(info->comm, lp + 1, clen);
     info->comm[clen] = '\0';
 
-    /* Skip fields after ')': state(0) ppid(1) ... utime(11) stime(12) */
+    /*
+     * Fields after ')': state(0) ppid(1) ... flags(6) ... utime(11) stime(12).
+     * flags carries PF_KTHREAD for kernel threads; unlike /proc/pid/exe it is
+     * readable for every task, whoever owns it.
+     */
     const char *p = rp + 2;
+    unsigned long flags = 0;
+    int field;
     info->utime = 0;
     info->stime = 0;
 
-    for (int field = 0; *p && field < 13; field++) {
+    for (field = 0; field < 13; field++) {
         while (*p == ' ') p++;
-        if (field == 11) info->utime = str_to_ulong(p);
+        if (!*p) break;                 /* record ends early */
+        if (field == 6) flags = str_to_ulong(p);
+        else if (field == 11) info->utime = str_to_ulong(p);
         else if (field == 12) info->stime = str_to_ulong(p);
         while (*p && *p != ' ') p++;
     }
+    if (field < 13) return -1;          /* truncated record: do not trust it */
 
+    info->is_kernel = (flags & PF_KTHREAD) != 0;
     return 0;
 }
 
@@ -707,34 +685,6 @@ static void parse_proc_io(const char *path, proc_info_t *info)
         line = str_chr(line, '\n');
         if (line) line++;
     }
-}
-
-/**
- * @brief Detect kernel thread by checking if /proc/pid/exe resolves.
- *        Uses sys_lstat (symlink exists?) + sys_stat (target exists?).
- */
-static int detect_kernel_thread(int pid)
-{
-    char path[PATH_BUF];
-    /* Build "/proc/<pid>/exe" manually */
-    char pidstr[16];
-    int pi = 0;
-    { /* itoa inline */
-        int v = pid;
-        char tmp[16]; int tp = 0;
-        if (v == 0) tmp[tp++] = '0';
-        else while (v) { tmp[tp++] = '0' + (char)(v % 10); v /= 10; }
-        while (tp > 0) pidstr[pi++] = tmp[--tp];
-        pidstr[pi] = '\0';
-    }
-    path_join(path, PATH_BUF, "/proc", pidstr);
-    int plen = (int)str_len(path);
-    path[plen] = '/'; path[plen+1] = 'e'; path[plen+2] = 'x'; path[plen+3] = 'e'; path[plen+4] = '\0';
-
-    struct kernel_stat st;
-    if (sys_lstat(path, &st) < 0) return 1;
-    if (sys_stat(path, &st) < 0)  return 1;
-    return 0;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -831,9 +781,6 @@ static void scan_one(snapshot_t *snap, const char *base_path, int override_tgid)
 
     path_join(path, PATH_BUF, base_path, "io");
     parse_proc_io(path, &tmp);
-
-    int check_pid = (override_tgid > 0) ? override_tgid : tmp.pid;
-    tmp.is_kernel = g_opts.hide_kernel ? detect_kernel_thread(check_pid) : 0;
 
     snap_grow(snap);
     snap->entries[snap->count] = tmp;

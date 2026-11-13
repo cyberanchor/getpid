@@ -11,7 +11,7 @@
  *   - Per-process disk I/O rate (read_bytes / write_bytes from /proc/pid/io)
  *   - Thread-level view (-t)
  *   - Focus on a single PID (-p PID)
- *   - Hide kernel threads (-k), detected via /proc/pid/exe symlink
+ *   - Hide kernel threads (-k), detected via the PF_KTHREAD task flag
  *   - Colorized output (green / yellow / red by normalized CPU load)
  *   - Fractional sampling intervals (e.g. -i 0.5)
  *   - Continuous refresh mode (-c)
@@ -37,7 +37,6 @@
 #include <errno.h>
 #include <getopt.h>
 #include <signal.h>
-#include <sys/stat.h>
 #include <sys/sysinfo.h>
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -47,6 +46,8 @@
 #define SNAP_INITIAL_CAP 1024  /**< Initial snapshot capacity; grows via realloc */
 #define COMM_LEN          256  /**< Max length of command name                   */
 #define PATH_BUF          512  /**< Generic path buffer size                     */
+
+#define PF_KTHREAD 0x00200000  /**< Task flag "I am a kernel thread" (linux/sched.h) */
 
 #define DEFAULT_TOP_N       20
 #define DEFAULT_INTERVAL   1.0 /**< seconds between two snapshots                */
@@ -92,10 +93,9 @@ static const char *color_reset(void)
  * @brief Snapshot of a single process (or thread) from /proc.
  *
  * Populated from:
- *   /proc/[pid]/stat    — PID, comm, utime, stime
+ *   /proc/[pid]/stat    — PID, comm, flags (kernel thread?), utime, stime
  *   /proc/[pid]/status  — VmRSS, Threads, Tgid
  *   /proc/[pid]/io      — read_bytes, write_bytes (disk I/O, not network)
- *   /proc/[pid]/exe     — symlink presence determines kernel vs userspace
  */
 typedef struct {
     int     pid;                /**< PID (or TID in thread mode)              */
@@ -121,7 +121,7 @@ typedef struct {
     double  io_write_rate;      /**< Disk write bytes/sec during interval     */
 
     int     num_threads;        /**< Thread count from /proc/pid/status       */
-    int     is_kernel;          /**< 1 if kernel thread (no /proc/pid/exe)    */
+    int     is_kernel;          /**< 1 if kernel thread (PF_KTHREAD in stat)  */
     int     is_new;             /**< 1 if not present in previous snapshot    */
 } proc_info_t;
 
@@ -196,7 +196,7 @@ static int read_file(const char *path, char *buf, size_t bufsz)
 }
 
 /**
- * @brief Parse /proc/[pid]/stat for PID, comm, utime, stime.
+ * @brief Parse /proc/[pid]/stat for PID, comm, flags, utime, stime.
  *
  * Layout (kernel 2.6+, unchanged through 6.15.x):
  *   pid (comm) state ppid pgrp session tty_nr tpgid flags
@@ -205,8 +205,15 @@ static int read_file(const char *path, char *buf, size_t bufsz)
  * The comm field can contain spaces and parentheses, so we locate
  * the *last* ')' to delimit it reliably.
  *
- * After ')': field[0]=state, ..., field[11]=utime, field[12]=stime
+ * After ')': field[0]=state, field[6]=flags, field[11]=utime, field[12]=stime
  * (0-indexed from the first token after the closing parenthesis).
+ *
+ * The flags field carries PF_KTHREAD for kernel threads.  Unlike the
+ * /proc/[pid]/exe symlink it is readable for every task regardless of
+ * who owns it, so the classification does not depend on our privileges.
+ *
+ * @return 0 on success, -1 if the file is unreadable or the record is
+ *         malformed/truncated.
  */
 static int parse_proc_stat(const char *path, proc_info_t *info)
 {
@@ -216,7 +223,7 @@ static int parse_proc_stat(const char *path, proc_info_t *info)
 
     char *lp = strchr(buf, '(');
     char *rp = strrchr(buf, ')');
-    if (!lp || !rp || rp <= lp)
+    if (!lp || !rp || rp <= lp || rp[1] != ' ')
         return -1;
 
     info->pid = atoi(buf);
@@ -227,20 +234,28 @@ static int parse_proc_stat(const char *path, proc_info_t *info)
     memcpy(info->comm, lp + 1, clen);
     info->comm[clen] = '\0';
 
-    /* Walk fields after ') ' to find utime (index 11) and stime (index 12) */
+    /* Walk fields after ') ': flags (index 6), utime (11), stime (12) */
     const char *p = rp + 2; /* skip ") " */
+    unsigned long flags = 0;
+    int field;
     info->utime = 0;
     info->stime = 0;
 
-    for (int field = 0; *p && field < 13; field++) {
+    for (field = 0; field < 13; field++) {
         while (*p == ' ') p++;
-        if (field == 11)
+        if (!*p) break;                 /* record ends early */
+        if (field == 6)
+            flags = strtoul(p, NULL, 10);
+        else if (field == 11)
             info->utime = strtoul(p, NULL, 10);
         else if (field == 12)
             info->stime = strtoul(p, NULL, 10);
         while (*p && *p != ' ') p++;
     }
+    if (field < 13)
+        return -1;                      /* truncated record: do not trust it */
 
+    info->is_kernel = (flags & PF_KTHREAD) != 0;
     return 0;
 }
 
@@ -291,40 +306,6 @@ static void parse_proc_io(const char *path, proc_info_t *info)
         line = strchr(line, '\n');
         if (line) line++;
     }
-}
-
-/**
- * @brief Detect whether a process is a kernel thread.
- *
- * Kernel threads have no userspace executable, so /proc/[pid]/exe
- * symlink either doesn't exist or points to nothing (readlink → ENOENT).
- * This is more reliable than checking whether comm starts with '[',
- * because the bracket convention is a display style used by ps/top,
- * not a kernel-level guarantee on the contents of /proc/pid/stat comm.
- *
- * @param pid  PID to check (use TGID for threads)
- * @return 1 if kernel thread, 0 if userspace process
- */
-static int detect_kernel_thread(int pid)
-{
-    char path[PATH_BUF];
-    struct stat st;
-
-    snprintf(path, sizeof(path), "/proc/%d/exe", pid);
-
-    /*
-     * lstat: check if the symlink itself exists.
-     *   fails → process vanished or no exe entry at all → treat as kernel.
-     * stat:  check if the symlink *target* resolves.
-     *   fails (ENOENT/EACCES) → kernel thread (symlink to nothing).
-     */
-    if (lstat(path, &st) != 0)
-        return 1;
-
-    if (stat(path, &st) != 0)
-        return 1;
-
-    return 0;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -399,10 +380,6 @@ static void scan_one(snapshot_t *snap, const char *base_path, int override_tgid)
 
     snprintf(path, sizeof(path), "%s/io", base_path);
     parse_proc_io(path, &tmp);
-
-    /* Detect kernel thread via /proc/pid/exe (use tgid for threads) */
-    int check_pid = (override_tgid > 0) ? override_tgid : tmp.pid;
-    tmp.is_kernel = detect_kernel_thread(check_pid);
 
     /* Commit to snapshot (with dynamic growth) */
     snapshot_grow(snap);
@@ -729,7 +706,7 @@ static void usage(void)
         "  -i, --interval SEC  Seconds between snapshots; fractional ok (default: 1.0)\n"
         "  -t, --threads       Show individual threads (TID view)\n"
         "  -p, --pid PID       Focus on a single PID (implies -t)\n"
-        "  -k, --hide-kernel   Hide kernel threads (detected via /proc/pid/exe)\n"
+        "  -k, --hide-kernel   Hide kernel threads (PF_KTHREAD flag in /proc/pid/stat)\n"
         "  -I, --no-io         Hide disk I/O rate columns\n"
         "  -c, --continuous    Repeat until Ctrl-C\n"
         "  -h, --help          Show this help\n"
