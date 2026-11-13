@@ -455,6 +455,17 @@ static void err_str(const char *s) {
     }
 }
 
+static void err_int(int v)
+{
+    char tmp[12];
+    int pos = 11;
+    unsigned int u = (v < 0) ? 0u - (unsigned int)v : (unsigned int)v;
+    tmp[pos] = '\0';
+    do { tmp[--pos] = (char)('0' + u % 10); u /= 10; } while (u);
+    if (v < 0) tmp[--pos] = '-';
+    err_str(tmp + pos);
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Arena allocator via sys_brk
  *
@@ -852,10 +863,6 @@ static void scan_dir_procs(snapshot_t *snap, const char *dirpath, int tgid)
                     scan_one(snap, entry_path, tgid);
                 } else {
                     int pid = str_to_int(d->d_name);
-                    if (g_opts.focus_pid > 0 && pid != g_opts.focus_pid) {
-                        pos += d->d_reclen;
-                        continue;
-                    }
                     if (g_opts.show_threads) {
                         char task_path[PATH_BUF];
                         path_join(task_path, PATH_BUF, entry_path, "task");
@@ -873,7 +880,42 @@ static void scan_dir_procs(snapshot_t *snap, const char *dirpath, int tgid)
 
 static void snapshot_collect(snapshot_t *snap)
 {
+    /*
+     * -p PID: go straight to /proc/<pid>/task instead of walking all of
+     * /proc.  This also accepts any thread ID of the process, not only the
+     * group leader: /proc/<tid> resolves for all of them, although the
+     * /proc directory listing shows leaders only.
+     */
+    if (g_opts.focus_pid > 0) {
+        char pidstr[16], tmp[16], dir[PATH_BUF], path[PATH_BUF];
+        int n = 0, t = 0;
+        unsigned int v = (unsigned int)g_opts.focus_pid;
+        do { tmp[t++] = (char)('0' + v % 10); v /= 10; } while (v);
+        while (t > 0) pidstr[n++] = tmp[--t];
+        pidstr[n] = '\0';
+
+        path_join(dir, PATH_BUF, "/proc", pidstr);
+        path_join(path, PATH_BUF, dir, "task");
+        scan_dir_procs(snap, path, g_opts.focus_pid);
+        return;
+    }
+
     scan_dir_procs(snap, "/proc", 0);
+}
+
+/**
+ * @brief In -p mode an empty snapshot means the target does not exist
+ *        (any more).  Say so and fail instead of printing an empty table
+ *        — forever, with -c.
+ */
+static void require_focus_pid(const snapshot_t *snap)
+{
+    if (g_opts.focus_pid > 0 && snap->count == 0) {
+        err_str("getpid: no such process: ");
+        err_int(g_opts.focus_pid);
+        err_str("\n");
+        sys_exit(1);
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1545,6 +1587,7 @@ static void real_main(long *sp)
         snapshot_t snap_a;
         snap_init(&snap_a);
         snapshot_collect(&snap_a);
+        require_focus_pid(&snap_a);
         long t_a = monotonic_ms();
 
         /* Wait */
@@ -1555,6 +1598,7 @@ static void real_main(long *sp)
         snapshot_t snap_b;
         snap_init(&snap_b);
         snapshot_collect(&snap_b);
+        require_focus_pid(&snap_b);
         long t_b = monotonic_ms();
 
         int elapsed_ms = (int)(t_b - t_a);

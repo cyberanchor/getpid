@@ -401,10 +401,44 @@ static void scan_one(snapshot_t *snap, const char *base_path, int override_tgid)
 }
 
 /**
+ * @brief Scan every thread of one process (/proc/[pid]/task/[tid]).
+ *
+ * @p pid may be any thread ID of the process, not only the group leader:
+ * /proc/[tid] resolves for all of them, although readdir("/proc") lists
+ * leaders only.
+ */
+static void scan_tasks(snapshot_t *snap, int pid)
+{
+    char task_dir[PATH_BUF];
+    snprintf(task_dir, sizeof(task_dir), "/proc/%d/task", pid);
+
+    DIR *tdir = opendir(task_dir);
+    if (!tdir)
+        return;                 /* process vanished (or never existed) */
+
+    struct dirent *tde;
+    while ((tde = readdir(tdir)) != NULL) {
+        if (!isdigit((unsigned char)tde->d_name[0]))
+            continue;
+        char tpath[PATH_BUF];
+        snprintf(tpath, sizeof(tpath), "/proc/%d/task/%s",
+                 pid, tde->d_name);
+        scan_one(snap, tpath, pid);
+    }
+    closedir(tdir);
+}
+
+/**
  * @brief Collect a full snapshot of all (or filtered) processes/threads.
  */
 static void snapshot_collect(snapshot_t *snap)
 {
+    /* -p PID: go straight to that process instead of walking all of /proc */
+    if (g_opts.focus_pid > 0) {
+        scan_tasks(snap, g_opts.focus_pid);
+        return;
+    }
+
     DIR *proc_dir = opendir("/proc");
     if (!proc_dir) {
         perror("getpid: opendir /proc");
@@ -419,25 +453,8 @@ static void snapshot_collect(snapshot_t *snap)
         int pid = atoi(de->d_name);
         if (pid <= 0) continue;
 
-        if (g_opts.focus_pid > 0 && pid != g_opts.focus_pid)
-            continue;
-
         if (g_opts.show_threads) {
-            char task_dir[PATH_BUF];
-            snprintf(task_dir, sizeof(task_dir), "/proc/%d/task", pid);
-            DIR *tdir = opendir(task_dir);
-            if (tdir) {
-                struct dirent *tde;
-                while ((tde = readdir(tdir)) != NULL) {
-                    if (!isdigit((unsigned char)tde->d_name[0]))
-                        continue;
-                    char tpath[PATH_BUF];
-                    snprintf(tpath, sizeof(tpath), "/proc/%d/task/%s",
-                             pid, tde->d_name);
-                    scan_one(snap, tpath, pid);
-                }
-                closedir(tdir);
-            }
+            scan_tasks(snap, pid);
         } else {
             char ppath[PATH_BUF];
             snprintf(ppath, sizeof(ppath), "/proc/%d", pid);
@@ -445,6 +462,19 @@ static void snapshot_collect(snapshot_t *snap)
         }
     }
     closedir(proc_dir);
+}
+
+/**
+ * @brief In -p mode an empty snapshot means the target does not exist
+ *        (any more).  Say so and fail instead of printing an empty table
+ *        — forever, with -c.
+ */
+static void require_focus_pid(const snapshot_t *snap)
+{
+    if (g_opts.focus_pid > 0 && snap->count == 0) {
+        fprintf(stderr, "getpid: no such process: %d\n", g_opts.focus_pid);
+        exit(1);
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -950,6 +980,7 @@ int main(int argc, char *argv[])
         snapshot_t snap_a;
         snapshot_init(&snap_a);
         snapshot_collect(&snap_a);
+        require_focus_pid(&snap_a);
         double t_a = monotonic_sec();
 
         precise_sleep(g_opts.interval);
@@ -961,6 +992,7 @@ int main(int argc, char *argv[])
         snapshot_t snap_b;
         snapshot_init(&snap_b);
         snapshot_collect(&snap_b);
+        require_focus_pid(&snap_b);
         double t_b = monotonic_sec();
 
         double elapsed = t_b - t_a;
