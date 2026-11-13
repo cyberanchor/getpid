@@ -848,11 +848,12 @@ static void scan_one(snapshot_t *snap, const char *base_path, int override_tgid)
 /**
  * @brief Iterate directory entries using raw getdents64.
  *        Calls scan_one for each numeric entry.
+ * @return 0 on success, -1 if the directory could not be opened.
  */
-static void scan_dir_procs(snapshot_t *snap, const char *dirpath, int tgid)
+static int scan_dir_procs(snapshot_t *snap, const char *dirpath, int tgid)
 {
     int fd = sys_open(dirpath, O_RDONLY);
-    if (fd < 0) return;
+    if (fd < 0) return -1;
 
     char dents[DENTS_BUF];
     for (;;) {
@@ -884,6 +885,7 @@ static void scan_dir_procs(snapshot_t *snap, const char *dirpath, int tgid)
         }
     }
     sys_close(fd);
+    return 0;
 }
 
 static void snapshot_collect(snapshot_t *snap)
@@ -908,7 +910,11 @@ static void snapshot_collect(snapshot_t *snap)
         return;
     }
 
-    scan_dir_procs(snap, "/proc", 0);
+    /* A task directory may vanish at any moment; /proc itself must not */
+    if (scan_dir_procs(snap, "/proc", 0) < 0) {
+        err_str("getpid: cannot open /proc\n");
+        sys_exit(1);
+    }
 }
 
 /**
@@ -1365,15 +1371,16 @@ static void precise_sleep_ms(int ms)
     req.tv_sec  = ms / 1000;
     req.tv_nsec = (long)(ms % 1000) * 1000000L;
 
-    for (;;) {
+    /*
+     * Test the flag before every sleep, not only after an interrupted one.
+     * A signal that arrived while we were still scanning /proc has already
+     * been handled, so nanosleep() is not interrupted by it and Ctrl-C
+     * would only take effect once the whole interval has passed.
+     */
+    while (g_running) {
         int rc = sys_nanosleep(&req, &rem);
-        if (rc == 0) break;        /* sleep completed */
-        if (!g_running) break;     /* Ctrl-C */
-        if (rc == -4) {            /* -EINTR: interrupted by signal */
-            req = rem;             /* sleep the remaining time */
-            continue;
-        }
-        break;                     /* other error: give up */
+        if (rc != -4) break;       /* completed, or a real error: give up */
+        req = rem;                 /* -EINTR: sleep the remaining time */
     }
 }
 

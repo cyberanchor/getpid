@@ -837,9 +837,14 @@ static void precise_sleep(double secs)
     req.tv_sec  = (time_t)secs;
     req.tv_nsec = (long)((secs - (double)req.tv_sec) * 1e9);
 
-    while (nanosleep(&req, &req) == -1) {
+    /*
+     * Test the flag before every sleep, not only after an interrupted one.
+     * A signal that arrived while we were still scanning /proc has already
+     * been handled, so nanosleep() is not interrupted by it and Ctrl-C
+     * would only take effect once the whole interval has passed.
+     */
+    while (g_running && nanosleep(&req, &req) == -1) {
         if (errno != EINTR) break;
-        if (!g_running)     break;
     }
 }
 
