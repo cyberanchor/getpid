@@ -22,6 +22,12 @@ musl-gcc -O2 -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
   -o getpid_raw getpid_raw.c -lgcc
 ```
 
+`getpid.c` is the same tool written against libc. It takes the same options, except `-v`:
+
+```sh
+gcc -O2 -Wall -Wextra -pedantic -std=gnu11 -o getpid getpid.c
+```
+
 ## Usage
 
 ```sh
@@ -33,11 +39,26 @@ musl-gcc -O2 -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
 | Flag | Description |
 |------|-------------|
 | `-n N` | Display top N processes (default: 20) |
-| `-i SEC` | Set sampling interval in seconds (default: 1.0) |
+| `-i SEC` | Set sampling interval in seconds (default: 1.0, minimum: 0.01) |
 | `-t` | Display individual threads (TID) |
-| `-p PID` | Monitor a specific PID (implies `-t`) |
+| `-p PID` | Monitor a specific process, given by its PID or any of its thread IDs (implies `-t`) |
 | `-k` | Exclude kernel threads from output |
 | `-I` | Exclude disk I/O statistics |
 | `-c` | Enable continuous refresh mode (SIGINT to terminate) |
 | `-v` | Display version information |
 | `-h` | Display help output |
+
+### Notes
+
+* Command names are printed with every byte outside printable ASCII replaced by `?`, so a process cannot inject terminal escape sequences or forge table rows.
+* A process that was not there at the start of the sampling interval, including one that reuses a recycled PID, is tagged `[new]` and shown with 0% CPU for that interval.
+* Colors and screen clearing are used only when the output is a terminal; output redirected to a file or a pipe stays plain text.
+* The exit status is 1 on invalid options, when the `-p` target does not exist or exits, and when `/proc` cannot be read.
+
+## Tests
+
+```sh
+make -C tests
+```
+
+Builds both programs and runs unit tests for their internals plus end-to-end tests against the live `/proc`. Requires `gcc`, `make` and `python3`.
