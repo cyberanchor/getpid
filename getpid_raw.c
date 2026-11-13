@@ -650,22 +650,61 @@ static int parse_proc_stat(const char *path, proc_info_t *info)
     return 0;
 }
 
+/** @brief Pick the fields we need out of one /proc/pid/status line. */
+static void status_line(const char *line, proc_info_t *info)
+{
+    if      (str_ncmp(line, "VmRSS:", 6) == 0) info->rss_kb = (long)str_to_ulong(line + 6);
+    else if (str_ncmp(line, "Tgid:",  5) == 0) info->tgid   = str_to_int(line + 5);
+}
+
+/**
+ * @brief Parse VmRSS and Tgid from /proc/[pid]/status.
+ *
+ * The file is consumed in chunks and handled line by line instead of being
+ * read once into a fixed buffer: the "Groups:" line comes before VmRSS and
+ * grows with the number of supplementary groups, so a single FILE_BUF-sized
+ * read can end before VmRSS is reached (such processes showed 0K RSS).
+ */
 static void parse_proc_status(const char *path, proc_info_t *info)
 {
     char buf[FILE_BUF];
-    if (read_file(path, buf, (int)sizeof(buf)) < 0)
-        return;
+    int fd = sys_open(path, O_RDONLY);
+    if (fd < 0) return;
 
     info->rss_kb = 0;
 
-    char *line = buf;
-    while (line && *line) {
-        if      (str_ncmp(line, "VmRSS:", 6) == 0) info->rss_kb = (long)str_to_ulong(line + 6);
-        else if (str_ncmp(line, "Tgid:",  5) == 0) info->tgid   = str_to_int(line + 5);
+    int have = 0;       /* bytes of an unfinished line kept at buf[0..have) */
+    int skipping = 0;   /* inside a line too long to buffer: ignore up to '\n' */
+    for (;;) {
+        ssize_t n = sys_read(fd, buf + have, (size_t)(FILE_BUF - 1 - have));
+        if (n == -4) continue;          /* -EINTR: retry */
+        if (n <= 0) break;              /* EOF or real error */
+        have += (int)n;
+        buf[have] = '\0';
 
-        line = str_chr(line, '\n');
-        if (line) line++;
+        char *line = buf;
+        char *nl;
+        while ((nl = str_chr(line, '\n')) != NULL) {
+            if (!skipping) status_line(line, info);
+            skipping = 0;
+            line = nl + 1;
+        }
+
+        /* Carry the unfinished tail over to the front of the buffer */
+        int tail = have - (int)(line - buf);
+        if (tail >= FILE_BUF - 1) {     /* a single line fills the buffer */
+            if (!skipping) status_line(line, info);
+            skipping = 1;
+            tail = 0;
+        }
+        for (int i = 0; i < tail; i++) buf[i] = line[i];
+        have = tail;
     }
+    if (have > 0 && !skipping) {        /* last line without a trailing '\n' */
+        buf[have] = '\0';
+        status_line(buf, info);
+    }
+    sys_close(fd);
 }
 
 static void parse_proc_io(const char *path, proc_info_t *info)

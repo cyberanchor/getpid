@@ -261,25 +261,35 @@ static int parse_proc_stat(const char *path, proc_info_t *info)
 
 /**
  * @brief Parse VmRSS, Threads, and Tgid from /proc/[pid]/status.
+ *
+ * The file is read line by line instead of into one fixed buffer: the
+ * "Groups:" line comes before VmRSS and grows with the number of
+ * supplementary groups, so a 4 KiB snapshot of the file can end before
+ * VmRSS is reached (which used to show such processes with 0K RSS).
  */
 static void parse_proc_status(const char *path, proc_info_t *info)
 {
-    char buf[4096];
-    if (read_file(path, buf, sizeof(buf)) < 0)
+    FILE *fp = fopen(path, "r");
+    if (!fp)
         return;
+
+    char iobuf[4096];
+    setvbuf(fp, iobuf, _IOFBF, sizeof(iobuf));
 
     info->rss_kb      = 0;
     info->num_threads = 1;
 
-    char *line = buf;
-    while (line && *line) {
-        if      (strncmp(line, "VmRSS:",  6) == 0) info->rss_kb      = strtol(line + 6, NULL, 10);
-        else if (strncmp(line, "Threads:", 8) == 0) info->num_threads = (int)strtol(line + 8, NULL, 10);
-        else if (strncmp(line, "Tgid:",   5) == 0)  info->tgid       = (int)strtol(line + 5, NULL, 10);
-
-        line = strchr(line, '\n');
-        if (line) line++;
+    char line[256];
+    int  at_line_start = 1;     /* fgets returns over-long lines in pieces */
+    while (fgets(line, sizeof(line), fp)) {
+        if (at_line_start) {
+            if      (strncmp(line, "VmRSS:",  6) == 0) info->rss_kb      = strtol(line + 6, NULL, 10);
+            else if (strncmp(line, "Threads:", 8) == 0) info->num_threads = (int)strtol(line + 8, NULL, 10);
+            else if (strncmp(line, "Tgid:",   5) == 0)  info->tgid       = (int)strtol(line + 5, NULL, 10);
+        }
+        at_line_start = (strchr(line, '\n') != NULL);
     }
+    fclose(fp);
 }
 
 /**
