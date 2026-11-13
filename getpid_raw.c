@@ -400,6 +400,14 @@ static void out_str_pad(const char *s, int width)
     for (int i = len; i < width; i++) out_char(' ');
 }
 
+/** @brief Left-pad string to width with spaces (right-justify). */
+static void out_str_rjust(const char *s, int width)
+{
+    int len = (int)str_len(s);
+    for (int i = len; i < width; i++) out_char(' ');
+    out_str(s);
+}
+
 /** @brief Right-justify int in field of given width.  Safe for INT_MIN. */
 static void out_int_rjust(int v, int width)
 {
@@ -1212,29 +1220,25 @@ static void print_results(snapshot_t *snap)
     out_char('\n');
     if (g_use_color) out_str("\033[1m");
 
-    /* Right-justify the PID/TID header like data rows */
-    {
-        const char *id_label = g_opts.show_threads ? "TID" : "PID";
-        int lbl_len = (int)str_len(id_label);
-        for (int pad = lbl_len; pad < 7; pad++) out_char(' ');
-        out_str(id_label);
-    }
+    /* Numeric columns are right-justified in the data rows, so their
+     * headers are too (same layout as the libc version's "%6s"). */
+    out_str_rjust(g_opts.show_threads ? "TID" : "PID", 7);
     out_str("  ");
     out_str_pad("COMMAND", 45);
     out_str("  ");
-    out_str_pad("USR%", 6);
+    out_str_rjust("USR%", 6);
     out_str("  ");
-    out_str_pad("SYS%", 6);
+    out_str_rjust("SYS%", 6);
     out_str("  ");
-    out_str_pad("CPU%", 6);
+    out_str_rjust("CPU%", 6);
     out_str("  ");
-    out_str_pad("RSS", 8);
+    out_str_rjust("RSS", 8);
 
     if (g_opts.show_io) {
         out_str("  ");
-        out_str_pad("IO_RD/s", 12);
+        out_str_rjust("IO_RD/s", 12);
         out_str("  ");
-        out_str_pad("IO_WR/s", 12);
+        out_str_rjust("IO_WR/s", 12);
     }
 
     if (g_use_color) out_str("\033[0m");
@@ -1606,7 +1610,9 @@ static void real_main(long *sp)
 
         compute_deltas(&snap_a, &snap_b, elapsed_ms);
 
-        if (g_opts.continuous)
+        /* Clear the screen between frames — only if there is a screen
+         * (g_use_color is "stdout is a TTY"); keep files and pipes clean. */
+        if (g_opts.continuous && g_use_color)
             out_str("\033[2J\033[H");
 
         print_results(&snap_b);

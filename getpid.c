@@ -1000,7 +1000,9 @@ int main(int argc, char *argv[])
 
         compute_deltas(&snap_a, &snap_b, elapsed);
 
-        if (g_opts.continuous)
+        /* Clear the screen between frames — only if there is a screen
+         * (g_use_color is "stdout is a TTY"); keep files and pipes clean. */
+        if (g_opts.continuous && g_use_color)
             printf("\033[2J\033[H");
 
         print_results(&snap_b, cores);
