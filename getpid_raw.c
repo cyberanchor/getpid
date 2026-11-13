@@ -1105,19 +1105,37 @@ static void get_full_cmd(int pid, int tgid, const char *comm_fallback,
 
 static void print_results(snapshot_t *snap)
 {
-    sort_procs(snap->entries, snap->count);
-
-    /* Aggregate totals */
+    /*
+     * Aggregate totals.  This has to happen before sorting: the entries are
+     * still in /proc scan order, where all threads of a process are adjacent.
+     * Threads share one address space, so in thread view every TID reports
+     * the RSS of the whole process — count it once per process, not once
+     * per thread.
+     */
     long total_cpu_x10 = 0;
     long total_rss = 0;
+    long group_rss = 0;
+    int  group_id  = -1;
     for (int i = 0; i < snap->count; i++) {
-        total_cpu_x10 += snap->entries[i].cpu_total_x10;
-        total_rss     += snap->entries[i].rss_kb;
+        const proc_info_t *e = &snap->entries[i];
+        int owner = (e->tgid > 0) ? e->tgid : e->pid;
+
+        if (owner != group_id) {
+            total_rss += group_rss;
+            group_id   = owner;
+            group_rss  = 0;
+        }
+        if (e->rss_kb > group_rss) group_rss = e->rss_kb;
+
+        total_cpu_x10 += e->cpu_total_x10;
     }
+    total_rss += group_rss;
+
+    sort_procs(snap->entries, snap->count);
 
     /* Summary line */
     out_str("\nCPU cores: "); out_int(g_cores);
-    out_str("  |  Processes: "); out_int(snap->count);
+    out_str(g_opts.show_threads ? "  |  Threads: " : "  |  Processes: "); out_int(snap->count);
     out_str("  |  Interval: "); out_fixed1((long)g_opts.interval_ms * 10 / 1000); out_char('s');
     out_str("  |  Total CPU: "); out_fixed1(total_cpu_x10); out_char('%');
     out_str("  |  Total RSS: "); out_mem_rjust(total_rss, 1);

@@ -604,25 +604,42 @@ static void print_separator(int width)
  */
 static void print_results(snapshot_t *snap, int cores)
 {
-    qsort(snap->entries, (size_t)snap->count, sizeof(proc_info_t), cmp_cpu_desc);
-
-    /* Aggregate totals across all processes */
+    /*
+     * Aggregate totals.  This has to happen before sorting: the entries are
+     * still in /proc scan order, where all threads of a process are adjacent.
+     * Threads share one address space, so in thread view every TID reports
+     * the RSS of the whole process — count it once per process, not once
+     * per thread.
+     */
     double total_cpu = 0.0;
     long   total_rss = 0;
-    double total_io_rd = 0.0, total_io_wr = 0.0;
+    long   group_rss = 0;
+    int    group_id  = -1;
 
     for (int i = 0; i < snap->count; i++) {
-        total_cpu   += snap->entries[i].cpu_total;
-        total_rss   += snap->entries[i].rss_kb;
-        total_io_rd += snap->entries[i].io_read_rate;
-        total_io_wr += snap->entries[i].io_write_rate;
+        const proc_info_t *e = &snap->entries[i];
+        int owner = (e->tgid > 0) ? e->tgid : e->pid;
+
+        if (owner != group_id) {
+            total_rss += group_rss;
+            group_id   = owner;
+            group_rss  = 0;
+        }
+        if (e->rss_kb > group_rss)
+            group_rss = e->rss_kb;
+
+        total_cpu += e->cpu_total;
     }
+    total_rss += group_rss;
+
+    qsort(snap->entries, (size_t)snap->count, sizeof(proc_info_t), cmp_cpu_desc);
 
     char rss_str[32];
     fmt_mem(total_rss, rss_str, sizeof(rss_str));
-    printf("\nCPU cores: %d  |  Processes: %d  |  Interval: %.1fs  |  "
+    printf("\nCPU cores: %d  |  %s: %d  |  Interval: %.1fs  |  "
            "Total CPU: %.1f%%  |  Total RSS: %s\n",
-           cores, snap->count, g_opts.interval, total_cpu, rss_str);
+           cores, g_opts.show_threads ? "Threads" : "Processes",
+           snap->count, g_opts.interval, total_cpu, rss_str);
 
     /* Column headers */
     if (g_opts.show_io) {
