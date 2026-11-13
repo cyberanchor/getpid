@@ -489,13 +489,27 @@ static void require_focus_pid(const snapshot_t *snap)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief Find a PID/TID in a snapshot via linear scan.
+ * @brief Find a PID/TID in a snapshot.
+ *
+ * Both snapshots are taken in /proc order, so the entry we are after is
+ * nearly always the one right behind the previous hit.  The scan therefore
+ * starts at @p hint and wraps around: the usual case costs one comparison
+ * instead of a walk from the top, which made the whole diff O(n^2).
+ *
+ * @param hint  In/out: index to start from; set to the slot after a hit.
  */
-static proc_info_t *snapshot_find(snapshot_t *snap, int pid)
+static proc_info_t *snapshot_find(snapshot_t *snap, int pid, int *hint)
 {
-    for (int i = 0; i < snap->count; i++) {
-        if (snap->entries[i].pid == pid)
+    int n = snap->count;
+    int start = (*hint < n) ? *hint : 0;
+
+    for (int k = 0; k < n; k++) {
+        int i = start + k;
+        if (i >= n) i -= n;
+        if (snap->entries[i].pid == pid) {
+            *hint = i + 1;
             return &snap->entries[i];
+        }
     }
     return NULL;
 }
@@ -517,10 +531,11 @@ static void compute_deltas(snapshot_t *snap_a, snapshot_t *snap_b,
     if (ticks_per_sec <= 0) ticks_per_sec = 100;
 
     double tick_to_pct = 100.0 / (elapsed_secs * (double)ticks_per_sec);
+    int hint = 0;
 
     for (int i = 0; i < snap_b->count; i++) {
         proc_info_t *b = &snap_b->entries[i];
-        proc_info_t *a = snapshot_find(snap_a, b->pid);
+        proc_info_t *a = snapshot_find(snap_a, b->pid, &hint);
 
         if (!a || a->starttime != b->starttime) {
             /*

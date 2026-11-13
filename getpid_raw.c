@@ -13,7 +13,7 @@
  *   sleep/nanosleep      → sys_nanosleep
  *   clock_gettime        → sys_clock_gettime
  *   isatty               → sys_ioctl(TCGETS)
- *   qsort                → custom insertion sort (good enough for ≤8K entries)
+ *   qsort                → custom Shell sort
  *   getopt               → custom argument parser
  *   signal               → sys_rt_sigaction
  *   get_nprocs            → parse /proc/cpuinfo or /sys/devices/system/cpu
@@ -941,11 +941,26 @@ static void require_focus_pid(const snapshot_t *snap)
  *  Delta computation
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-static proc_info_t *snap_find(snapshot_t *snap, int pid)
+/**
+ * @brief Find a PID/TID in a snapshot.
+ *
+ * Both snapshots are taken in /proc order, so the entry we are after is
+ * nearly always the one right behind the previous hit.  The scan therefore
+ * starts at *hint and wraps around: the usual case costs one comparison
+ * instead of a walk from the top, which made the whole diff O(n^2).
+ */
+static proc_info_t *snap_find(snapshot_t *snap, int pid, int *hint)
 {
-    for (int i = 0; i < snap->count; i++) {
-        if (snap->entries[i].pid == pid)
+    int n = snap->count;
+    int start = (*hint < n) ? *hint : 0;
+
+    for (int k = 0; k < n; k++) {
+        int i = start + k;
+        if (i >= n) i -= n;
+        if (snap->entries[i].pid == pid) {
+            *hint = i + 1;
             return &snap->entries[i];
+        }
     }
     return NULL;
 }
@@ -966,10 +981,11 @@ static void compute_deltas(snapshot_t *sa, snapshot_t *sb, int elapsed_ms)
     if (elapsed_ms <= 0) elapsed_ms = 1;
     /* ticks_per_sec = 100 (kernel HZ for userspace accounting) */
     long divisor = (long)elapsed_ms * 100; /* elapsed_ms * CLK_TCK */
+    int hint = 0;
 
     for (int i = 0; i < sb->count; i++) {
         proc_info_t *b = &sb->entries[i];
-        proc_info_t *a = snap_find(sa, b->pid);
+        proc_info_t *a = snap_find(sa, b->pid, &hint);
 
         /* Not seen before — or the PID was recycled by another process */
         if (!a || a->starttime != b->starttime) {
@@ -997,7 +1013,7 @@ static void compute_deltas(snapshot_t *sa, snapshot_t *sb, int elapsed_ms)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- *  Sorting — insertion sort (no qsort dependency)
+ *  Sorting — Shell sort (no qsort dependency)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
@@ -1013,17 +1029,30 @@ static int proc_cmp(const proc_info_t *a, const proc_info_t *b)
     return (a->pid < b->pid) ? 1 : (a->pid > b->pid) ? -1 : 0;
 }
 
-/** @brief Insertion sort — O(n²) but no recursion, no stack, stable. */
+/**
+ * @brief Shell sort (Knuth gaps 1, 4, 13, 40, ...): no recursion, no extra
+ *        memory, and far fewer moves than the plain insertion sort it grew
+ *        out of, whose n^2/4 moves of ~230-byte records took over a second
+ *        per refresh at 30K threads.
+ *
+ * Not stable, which does not matter: proc_cmp() is a total order, because
+ * the PIDs within one snapshot are unique.
+ */
 static void sort_procs(proc_info_t *arr, int n)
 {
-    for (int i = 1; i < n; i++) {
-        proc_info_t key = arr[i];
-        int j = i - 1;
-        while (j >= 0 && proc_cmp(&key, &arr[j]) > 0) {
-            arr[j + 1] = arr[j];
-            j--;
+    int gap = 1;
+    while (gap < n / 3) gap = gap * 3 + 1;
+
+    for (; gap >= 1; gap /= 3) {
+        for (int i = gap; i < n; i++) {
+            proc_info_t key = arr[i];
+            int j = i - gap;
+            while (j >= 0 && proc_cmp(&key, &arr[j]) > 0) {
+                arr[j + gap] = arr[j];
+                j -= gap;
+            }
+            arr[j + gap] = key;
         }
-        arr[j + 1] = key;
     }
 }
 
