@@ -36,6 +36,7 @@
 #include <time.h>
 #include <errno.h>
 #include <getopt.h>
+#include <limits.h>
 #include <signal.h>
 #include <sys/sysinfo.h>
 
@@ -51,6 +52,8 @@
 
 #define DEFAULT_TOP_N       20
 #define DEFAULT_INTERVAL   1.0 /**< seconds between two snapshots                */
+#define MIN_INTERVAL      0.01 /**< 10 ms, the same floor as getpid_raw          */
+#define MAX_INTERVAL 2147483.0 /**< ~24.8 days, the same ceiling as getpid_raw   */
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  ANSI color support
@@ -757,7 +760,8 @@ static void usage(void)
         "\n"
         "Options:\n"
         "  -n, --top N         Show top N processes (default: 20)\n"
-        "  -i, --interval SEC  Seconds between snapshots; fractional ok (default: 1.0)\n"
+        "  -i, --interval SEC  Seconds between snapshots; fractional ok (default: 1.0,\n"
+        "                      minimum: 0.01)\n"
         "  -t, --threads       Show individual threads (TID view)\n"
         "  -p, --pid PID       Focus on a single PID (implies -t)\n"
         "  -k, --hide-kernel   Hide kernel threads (PF_KTHREAD flag in /proc/pid/stat)\n"
@@ -810,6 +814,72 @@ static void precise_sleep(double secs)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ *  Strict option-value parsing (same rules as getpid_raw)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief Parse a decimal integer that must fit in an int.
+ *
+ * Rejects everything atoi() would silently turn into 0 or cut short:
+ * "abc", "5x", "", leading blanks, out-of-range values.
+ */
+static int parse_int_strict(const char *s, int *out)
+{
+    char *end;
+
+    if (!isdigit((unsigned char)s[0]) && s[0] != '-' && s[0] != '+')
+        return 0;
+
+    errno = 0;
+    long v = strtol(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0' || v < INT_MIN || v > INT_MAX)
+        return 0;
+
+    *out = (int)v;
+    return 1;
+}
+
+/**
+ * @brief Parse an interval in seconds: digits with at most one '.'.
+ *
+ * No sign, exponent, "inf" or "nan" — atof() accepted all of those, and a
+ * NaN/infinite interval made nanosleep() fail, turning -c into a busy loop.
+ */
+static int parse_interval_strict(const char *s, double *out)
+{
+    int digits = 0, dots = 0;
+
+    for (const char *p = s; *p; p++) {
+        if (isdigit((unsigned char)*p))    digits++;
+        else if (*p == '.' && dots == 0)   dots++;
+        else                               return 0;
+    }
+    if (digits == 0)
+        return 0;
+
+    double v = strtod(s, NULL);
+    if (v > MAX_INTERVAL)
+        return 0;
+
+    *out = v;
+    return 1;
+}
+
+static void fail_invalid_number(const char *opt, const char *val)
+{
+    fprintf(stderr, "Invalid numeric value for %s: %s\n", opt, val);
+    usage();
+    exit(1);
+}
+
+static void fail_invalid_value(const char *opt, const char *msg, const char *val)
+{
+    fprintf(stderr, "Invalid value for %s: %s %s\n", opt, val, msg);
+    usage();
+    exit(1);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  *  Main
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -830,11 +900,26 @@ int main(int argc, char *argv[])
     int opt;
     while ((opt = getopt_long(argc, argv, "n:i:tp:kIch", longopts, NULL)) != -1) {
         switch (opt) {
-        case 'n': g_opts.top_n        = atoi(optarg);   break;
-        case 'i': g_opts.interval     = atof(optarg);   break;
+        case 'n':
+            if (!parse_int_strict(optarg, &g_opts.top_n))
+                fail_invalid_number("-n", optarg);
+            if (g_opts.top_n <= 0)
+                fail_invalid_value("-n", "must be > 0", optarg);
+            break;
+        case 'i':
+            if (!parse_interval_strict(optarg, &g_opts.interval))
+                fail_invalid_number("-i", optarg);
+            if (g_opts.interval < MIN_INTERVAL)
+                fail_invalid_value("-i", "minimum is 10 ms", optarg);
+            break;
         case 't': g_opts.show_threads = 1;               break;
-        case 'p': g_opts.focus_pid    = atoi(optarg);
-                  g_opts.show_threads = 1;               break;
+        case 'p':
+            if (!parse_int_strict(optarg, &g_opts.focus_pid))
+                fail_invalid_number("-p", optarg);
+            if (g_opts.focus_pid <= 0)
+                fail_invalid_value("-p", "pid must be > 0", optarg);
+            g_opts.show_threads = 1;
+            break;
         case 'k': g_opts.hide_kernel  = 1;               break;
         case 'I': g_opts.show_io      = 0;               break;
         case 'c': g_opts.continuous   = 1;               break;
@@ -843,8 +928,11 @@ int main(int argc, char *argv[])
         }
     }
 
-    if (g_opts.top_n    <= 0)    g_opts.top_n    = DEFAULT_TOP_N;
-    if (g_opts.interval <= 0.01) g_opts.interval = DEFAULT_INTERVAL;
+    if (optind < argc) {
+        fprintf(stderr, "Unexpected argument: %s\n", argv[optind]);
+        usage();
+        return 1;
+    }
 
     g_use_color = isatty(STDOUT_FILENO);
 
