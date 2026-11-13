@@ -26,7 +26,7 @@
  *
  */
 
-#define GETPID_VERSION "0.4.0"
+#define GETPID_VERSION "0.5.0"
 #define GETPID_BANNER  "getpid " GETPID_VERSION " — pure-syscall Linux process inspector"
 
 /* ═══════════════════════════════════════════════════════════════════════════
